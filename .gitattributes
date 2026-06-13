@@ -1,0 +1,10 @@
+# Normalise line endings: store text as LF in the repo.
+* text=auto eol=lf
+
+# These MUST stay LF even on Windows checkouts (CRLF breaks them).
+*.sh text eol=lf
+docker/docker-entrypoint.sh text eol=lf
+Dockerfile text eol=lf
+
+# Lockfiles / generated — keep LF.
+package-lock.json text eol=lf

@@ -1,0 +1,34 @@
+# Convenience wrapper. Build needs the Flowable registry token as a secret:
+#   docker compose build           # uses the npmrc secret below
+#   docker compose up              # runs with the environment values below
+#
+# Edit the environment block per deployment (or override via a .env file that
+# docker compose reads automatically). One image, reconfigured here at runtime.
+services:
+  landing:
+    build:
+      context: .
+      secrets:
+        - npmrc
+    ports:
+      - "8080:80"
+    environment:
+      # How the browser reaches Flowable:
+      #  - USE_DEV_PROXY=true  -> calls /flowable-api/*, nginx proxies to
+      #    FLOWABLE_BACKEND_URL (no CORS). Recommended.
+      #  - USE_DEV_PROXY=false -> calls FLOWABLE_API_URL directly (needs CORS).
+      USE_DEV_PROXY: "true"
+      FLOWABLE_BACKEND_URL: "http://host.docker.internal:8090"
+      FLOWABLE_API_URL: ""
+      FLOWABLE_API_TOKEN: "" # JWT/token — note it is exposed to the browser
+      # Start-instance flow:
+      FLOWABLE_FORM_KEY: "newRequestForm"
+      FLOWABLE_START_KIND: "case" # process | case
+      FLOWABLE_DEFINITION_KEY: "requestCase"
+    # Lets host.docker.internal resolve on Linux (already works on Mac/Windows).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+secrets:
+  npmrc:
+    file: ~/.npmrc
