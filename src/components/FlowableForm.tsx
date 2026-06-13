@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Form, type FlowableFormConfig } from "@flowable/forms";
+import type { FormDefinition } from "../lib/flowableClient";
 
 // Flowable Forms ships two stylesheets at the package root:
 //   external.min.css — vendored third-party + base styles
@@ -29,8 +30,16 @@ type LoadState =
   | {
       status: "ready";
       config: FlowableFormConfig;
+      name?: string;
       payload: Record<string, unknown>;
     };
+
+/** A loader may return a bare form model or a `{ config, name }` definition. */
+function normalizeDefinition(
+  result: FlowableFormConfig | FormDefinition
+): FormDefinition {
+  return "rows" in result ? { config: result } : result;
+}
 
 interface FlowableFormProps {
   /**
@@ -38,7 +47,9 @@ interface FlowableFormProps {
    * passes a "form by key" loader, the task flow passes a "form by taskId"
    * loader. Receives an AbortSignal for cleanup.
    */
-  loadDefinition: (signal?: AbortSignal) => Promise<FlowableFormConfig>;
+  loadDefinition: (
+    signal?: AbortSignal
+  ) => Promise<FlowableFormConfig | FormDefinition>;
   /**
    * Optionally loads the form's initial values (the `root.*` payload). Used by
    * the task flow to pre-fill fields with the task's existing variables. Merged
@@ -55,6 +66,16 @@ interface FlowableFormProps {
   ) => void | Promise<unknown>;
   /** Called after onSubmit resolves successfully. */
   onSubmitted?: (values: Record<string, unknown>, outcome: unknown) => void;
+  /**
+   * Called once the form model + initial payload are loaded. Gives the host the
+   * resolved `config`, the definition `name` (if any), and the initial
+   * `payload` — e.g. to derive a page title from a field or the form name.
+   */
+  onLoaded?: (info: {
+    config: FlowableFormConfig;
+    name?: string;
+    payload: Record<string, unknown>;
+  }) => void;
   /** Initial form values. */
   initialPayload?: Record<string, unknown>;
   /**
@@ -97,6 +118,7 @@ export function FlowableForm({
   loadPayload,
   onSubmit,
   onSubmitted,
+  onLoaded,
   initialPayload = {},
   reloadKey = "form",
   showSubmitButton,
@@ -120,11 +142,13 @@ export function FlowableForm({
       loadDefinition(controller.signal),
       loadPayload ? loadPayload(controller.signal) : Promise.resolve(undefined),
     ])
-      .then(([config, loaded]) => {
+      .then(([definition, loaded]) => {
         if (controller.signal.aborted) return;
+        const { config, name } = normalizeDefinition(definition);
         const payload = { ...initialPayload, ...(loaded ?? {}) };
         payloadRef.current = payload;
-        setState({ status: "ready", config, payload });
+        setState({ status: "ready", config, name, payload });
+        onLoaded?.({ config, name, payload });
       })
       .catch((err: unknown) => {
         if (controller.signal.aborted) return;

@@ -18,7 +18,22 @@ import { apiBase, env } from "../config/env";
 interface FormDefinitionRef {
   id: string;
   version?: number;
+  name?: string;
 }
+
+/** A form model plus the definition metadata (its display `name`) around it. */
+export interface FormDefinition {
+  config: FlowableFormConfig;
+  /** The form definition's display name, if the deployment returned one. */
+  name?: string;
+}
+
+/**
+ * Key of the (typically hidden) form field whose value overrides the page
+ * title. Author this field in the form designer with a static default value to
+ * set a per-form landing title without touching code. See resolveFormTitle().
+ */
+export const TITLE_FIELD = "landingTitle";
 
 /** Build an absolute (or dev-proxied) URL from a path template + substitutions. */
 export function urlFor(
@@ -88,27 +103,34 @@ export function findConfig(json: unknown): FlowableFormConfig | null {
 }
 
 /**
- * From a list-of-definitions response, pick the id of the latest version.
+ * From a list-of-definitions response, pick the latest version's metadata.
  * Accepts either `{ data: [...] }` (Flowable Work) or a bare array.
  */
-function pickLatestDefinitionId(json: unknown): string | null {
+function pickLatestDefinition(json: unknown): FormDefinitionRef | null {
   const obj = json as Record<string, unknown>;
   const list = (Array.isArray(json) ? json : obj?.data) as
     | FormDefinitionRef[]
     | undefined;
   if (!Array.isArray(list) || list.length === 0) return null;
 
-  const latest = list.reduce((a, b) =>
-    (b.version ?? 0) > (a.version ?? 0) ? b : a
-  );
-  return latest.id ?? null;
+  return list.reduce((a, b) => ((b.version ?? 0) > (a.version ?? 0) ? b : a));
 }
 
-/** Fetch and return the form model (`{ rows: [...] }`) for the given form key. */
-export async function fetchFormByKey(
+/** Read a `name` string off an object, if present. */
+function readName(json: unknown): string | undefined {
+  const name = (json as Record<string, unknown> | null | undefined)?.name;
+  return typeof name === "string" && name.trim() ? name : undefined;
+}
+
+/**
+ * Fetch the form model AND its definition `name` for a key. Same two-step
+ * lookup as fetchFormByKey, but preserves the surrounding metadata so callers
+ * can use the form's display name (e.g. as a page-title fallback).
+ */
+export async function fetchFormDefinition(
   formKey: string = env.formKey,
   signal?: AbortSignal
-): Promise<FlowableFormConfig> {
+): Promise<FormDefinition> {
   if (!formKey) {
     throw new Error(
       "No form key configured. Set VITE_FLOWABLE_FORM_KEY in your .env."
@@ -121,18 +143,18 @@ export async function fetchFormByKey(
 
   // Some deployments return the full model directly — use it if so.
   const direct = findConfig(lookup);
-  if (direct) return direct;
+  if (direct) return { config: direct, name: readName(lookup) };
 
-  // Step 2: resolve the latest version's id, then fetch its model.
-  const id = pickLatestDefinitionId(lookup);
-  if (!id) {
+  // Step 2: resolve the latest version, then fetch its model.
+  const latest = pickLatestDefinition(lookup);
+  if (!latest?.id) {
     throw new Error(
       `No form definition found for key "${formKey}" at ${lookupUrl}. ` +
         "Check the key and VITE_FLOWABLE_FORM_PATH."
     );
   }
 
-  const modelUrl = urlFor(env.formModelPath, { id });
+  const modelUrl = urlFor(env.formModelPath, { id: latest.id });
   const model = await getJson(modelUrl, signal);
 
   const config = findConfig(model);
@@ -142,7 +164,87 @@ export async function fetchFormByKey(
         "Adjust findConfig()/VITE_FLOWABLE_FORM_MODEL_PATH in src/lib/flowableClient.ts."
     );
   }
-  return config;
+  // Prefer a name on the model response; fall back to the list metadata.
+  return { config, name: readName(model) ?? latest.name };
+}
+
+/** Fetch and return just the form model (`{ rows: [...] }`) for the given key. */
+export async function fetchFormByKey(
+  formKey: string = env.formKey,
+  signal?: AbortSignal
+): Promise<FlowableFormConfig> {
+  return (await fetchFormDefinition(formKey, signal)).config;
+}
+
+/**
+ * The payload key a component binds to is carried in its `value` as a binding
+ * expression — `{{fieldKey}}` (Flowable Forms) or `${fieldKey}`. The visible
+ * `id` is an unrelated stencil id (e.g. `text3`). Return the bound key, if any.
+ */
+function bindingKey(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const match = value.trim().match(/^\{\{\s*([\w.$]+)\s*\}\}$|^\$\{\s*([\w.$]+)\s*\}$/);
+  return match ? match[1] ?? match[2] : undefined;
+}
+
+/**
+ * Deep-walk a form model for the component bound to `fieldKey` and return its
+ * authored static value (`defaultValue`). Matches on the `{{binding}}` in
+ * `value` — falling back to a literal `id === fieldKey`. Resilient to nesting
+ * (panels, sections, tabs) because it searches the whole object tree.
+ */
+function deepFindFieldValue(node: unknown, fieldKey: string): unknown {
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = deepFindFieldValue(item, fieldKey);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  if (node && typeof node === "object") {
+    const obj = node as Record<string, unknown>;
+    if (bindingKey(obj.value) === fieldKey) {
+      // `value` is the binding expression, so the seed is in `defaultValue`.
+      if (obj.defaultValue !== undefined) return obj.defaultValue;
+    } else if (obj.id === fieldKey && ("value" in obj || "defaultValue" in obj)) {
+      return obj.value ?? obj.defaultValue;
+    }
+    for (const value of Object.values(obj)) {
+      const found = deepFindFieldValue(value, fieldKey);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve a field's value, preferring the live `payload` (the form's resolved
+ * values) and falling back to the value authored in the model definition.
+ */
+export function extractFieldValue(
+  config: FlowableFormConfig,
+  fieldKey: string,
+  payload?: Record<string, unknown>
+): unknown {
+  if (payload && payload[fieldKey] != null) return payload[fieldKey];
+  return deepFindFieldValue(config, fieldKey);
+}
+
+/**
+ * Resolve the page title from a loaded form, in precedence order:
+ *   1. a (hidden) form field's value — TITLE_FIELD, authored per form
+ *   2. the form definition's display name
+ *   3. the supplied static `fallback`
+ */
+export function resolveFormTitle(
+  info: { config: FlowableFormConfig; name?: string; payload?: Record<string, unknown> },
+  fallback: string,
+  fieldKey: string = TITLE_FIELD
+): string {
+  const fromField = extractFieldValue(info.config, fieldKey, info.payload);
+  if (typeof fromField === "string" && fromField.trim()) return fromField;
+  if (info.name && info.name.trim()) return info.name;
+  return fallback;
 }
 
 /**
